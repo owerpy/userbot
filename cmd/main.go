@@ -104,15 +104,27 @@ func main() {
 		if kind != "truck" {
 			kind = "cargo"
 		}
+		// Приводим регионы и кузов к справочнику приложения: в объявлениях
+		// пишут «Samarqand», «Тошкент вилояти», а фильтры ищут «Самарканд».
+		fromRegion, fromCountry := internal.NormalizeRegion(parsed.FromRegion)
+		toRegion, toCountry := internal.NormalizeRegion(parsed.ToRegion)
+		if fromCountry == "" {
+			fromCountry = parsed.FromCountry
+		}
+		if toCountry == "" {
+			toCountry = parsed.ToCountry
+		}
+		vehType := internal.NormalizeVehicle(parsed.VehicleType)
+
 		ins := internal.AdInput{
 			Kind:            kind,
-			FromRegion:      parsed.FromRegion,
-			ToRegion:        parsed.ToRegion,
-			FromCountry:     parsed.FromCountry,
-			ToCountry:       parsed.ToCountry,
+			FromRegion:      fromRegion,
+			ToRegion:        toRegion,
+			FromCountry:     fromCountry,
+			ToCountry:       toCountry,
 			CargoDesc:       parsed.CargoDesc,
 			WeightKg:        parsed.WeightKg,
-			VehicleType:     parsed.VehicleType,
+			VehicleType:     vehType,
 			PriceText:       parsed.PriceText,
 			DateText:        parsed.DateText,
 			ContactPhone:    parsed.ContactPhone,
@@ -306,7 +318,7 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 	if err != nil {
 		return
 	}
-	limit := 30
+	limit := 15
 	if v := os.Getenv("BOARD_BACKFILL_LIMIT"); v != "" {
 		fmt.Sscanf(v, "%d", &limit)
 	}
@@ -352,7 +364,7 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 				continue
 			}
 			handle(peer.ChannelID, username, msg)
-			time.Sleep(400 * time.Millisecond) // не долбим Groq пачкой
+			time.Sleep(1500 * time.Millisecond) // щадящий темп: бесплатный лимит Groq ~12k токенов/мин
 		}
 		log.Info("backfill done", zap.String("channel", c.Channel))
 	}
