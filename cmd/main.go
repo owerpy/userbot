@@ -147,10 +147,17 @@ func main() {
 		if !ok {
 			return nil
 		}
+		// Entities не всегда содержат канал — тогда username пустой,
+		// и матчим по ID (он резолвится при старте из @username).
 		username := ""
-		if ch, ok := e.Channels[peer.ChannelID]; ok {
+		if ch, okc := e.Channels[peer.ChannelID]; okc {
 			username = ch.Username
 		}
+		log.Info("post received",
+			zap.Int64("channel_id", peer.ChannelID),
+			zap.String("username", username),
+			zap.Int("msg_id", msg.ID),
+			zap.Bool("watched", watched.Match(peer.ChannelID, username)))
 		handleNew(peer.ChannelID, username, msg)
 		return nil
 	})
@@ -182,7 +189,31 @@ func main() {
 		}
 		log.Info("logged in", zap.String("user", self.Username), zap.Int64("id", self.ID))
 
-		return gaps.Run(ctx, client.API(), self.ID, updates.AuthOptions{
+		api := client.API()
+
+		// Резолвим @username каналов в их числовые ID — так матчинг постов
+		// работает даже когда Telegram не прислал Entities.
+		resolveWatched(ctx, api, store, watched, log)
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					resolveWatched(ctx, api, store, watched, log)
+				}
+			}
+		}()
+
+		// Первичная загрузка: читаем последние посты каналов, чтобы доска
+		// не была пустой до появления новых сообщений.
+		if os.Getenv("BOARD_BACKFILL") != "0" {
+			go backfill(ctx, api, store, log, handleNew)
+		}
+
+		return gaps.Run(ctx, api, self.ID, updates.AuthOptions{
 			OnStart: func(ctx context.Context) {
 				log.Info("listening for channel posts...")
 			},
@@ -231,4 +262,98 @@ func (a termAuth) Code(_ context.Context, _ *tg.AuthSentCode) (string, error) {
 func (a termAuth) AcceptTermsOfService(_ context.Context, _ tg.HelpTermsOfService) error { return nil }
 func (a termAuth) SignUp(_ context.Context) (auth.UserInfo, error) {
 	return auth.UserInfo{}, fmt.Errorf("signup not supported")
+}
+
+// resolveWatched — превращает @username каналов в числовые ID и запоминает их.
+// Нужно потому, что в апдейтах Telegram часто не присылает данные о канале,
+// и сопоставить пост с каналом можно только по ID.
+func resolveWatched(ctx context.Context, api *tg.Client, store *internal.Store,
+	ws *internal.WatchSet, log *zap.Logger) {
+
+	chans, err := store.ActiveChannels(ctx)
+	if err != nil {
+		log.Warn("resolve: load channels", zap.Error(err))
+		return
+	}
+	for _, c := range chans {
+		uname := strings.TrimPrefix(strings.TrimSpace(c.Channel), "@")
+		if uname == "" {
+			continue
+		}
+		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: uname})
+		if err != nil {
+			log.Warn("resolve username", zap.String("channel", c.Channel), zap.Error(err))
+			continue
+		}
+		for _, ch := range res.Chats {
+			if full, ok := ch.(*tg.Channel); ok {
+				ws.Bind(full.Username, full.ID, full.AccessHash)
+				log.Info("channel resolved",
+					zap.String("username", full.Username), zap.Int64("id", full.ID))
+			}
+		}
+	}
+}
+
+// backfill — разовая подгрузка последних постов каналов при старте,
+// чтобы доска сразу наполнилась, а не ждала новых сообщений.
+func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
+	log *zap.Logger, handle func(int64, string, *tg.Message)) {
+
+	time.Sleep(3 * time.Second) // дать резолву отработать
+
+	chans, err := store.ActiveChannels(ctx)
+	if err != nil {
+		return
+	}
+	limit := 30
+	if v := os.Getenv("BOARD_BACKFILL_LIMIT"); v != "" {
+		fmt.Sscanf(v, "%d", &limit)
+	}
+
+	for _, c := range chans {
+		uname := strings.TrimPrefix(strings.TrimSpace(c.Channel), "@")
+		if uname == "" {
+			continue
+		}
+		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: uname})
+		if err != nil {
+			log.Warn("backfill resolve", zap.String("channel", c.Channel), zap.Error(err))
+			continue
+		}
+		var peer *tg.InputPeerChannel
+		var username string
+		for _, ch := range res.Chats {
+			if full, ok := ch.(*tg.Channel); ok {
+				peer = &tg.InputPeerChannel{ChannelID: full.ID, AccessHash: full.AccessHash}
+				username = full.Username
+			}
+		}
+		if peer == nil {
+			continue
+		}
+
+		hist, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:  peer,
+			Limit: limit,
+		})
+		if err != nil {
+			log.Warn("backfill history", zap.String("channel", c.Channel), zap.Error(err))
+			continue
+		}
+		msgs, ok := hist.(*tg.MessagesChannelMessages)
+		if !ok {
+			continue
+		}
+		log.Info("backfill start", zap.String("channel", c.Channel), zap.Int("messages", len(msgs.Messages)))
+		for _, m := range msgs.Messages {
+			msg, ok := m.(*tg.Message)
+			if !ok || strings.TrimSpace(msg.Message) == "" {
+				continue
+			}
+			handle(peer.ChannelID, username, msg)
+			time.Sleep(400 * time.Millisecond) // не долбим Groq пачкой
+		}
+		log.Info("backfill done", zap.String("channel", c.Channel))
+	}
 }
