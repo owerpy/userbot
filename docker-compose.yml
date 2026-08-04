@@ -1,0 +1,18 @@
+services:
+  board-userbot:
+    build: .
+    image: board-userbot:latest
+    container_name: board_userbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - board_session:/data        # сессия Telegram — не удаляй том, иначе вход заново
+    networks: [truck_net]          # та же сеть, что у бэкенда и Postgres
+
+volumes:
+  board_session:
+
+networks:
+  truck_net:
+    external: true                 # сеть уже создана стеком truck-delivery
+    name: truck-delivery_truck_net
