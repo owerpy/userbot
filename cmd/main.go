@@ -292,7 +292,7 @@ func resolveWatched(ctx context.Context, api *tg.Client, store *internal.Store,
 		if uname == "" {
 			continue
 		}
-		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: uname})
+		res, err := api.ContactsResolveUsername(ctx, uname)
 		if err != nil {
 			log.Warn("resolve username", zap.String("channel", c.Channel), zap.Error(err))
 			continue
@@ -328,7 +328,7 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 		if uname == "" {
 			continue
 		}
-		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: uname})
+		res, err := api.ContactsResolveUsername(ctx, uname)
 		if err != nil {
 			log.Warn("backfill resolve", zap.String("channel", c.Channel), zap.Error(err))
 			continue
