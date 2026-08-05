@@ -82,7 +82,8 @@ func main() {
 			return
 		}
 		// разбираем через ИИ
-		pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Запас на повторы при лимите Groq (он просит ждать по 3-6 сек).
+		pctx, pcancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer pcancel()
 		parsed, err := groq.Parse(pctx, text)
 		if err != nil {
@@ -144,7 +145,7 @@ func main() {
 			return
 		}
 		if ok {
-			log.Info("ad added", zap.String("route", parsed.FromRegion+"→"+parsed.ToRegion),
+			log.Info("ad added", zap.String("route", fromRegion+"→"+toRegion),
 				zap.String("kind", kind), zap.String("src", ins.SourceChannel))
 		}
 	}
@@ -364,7 +365,7 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 				continue
 			}
 			handle(peer.ChannelID, username, msg)
-			time.Sleep(1500 * time.Millisecond) // щадящий темп: бесплатный лимит Groq ~12k токенов/мин
+			time.Sleep(4 * time.Second) // ~12k токенов/мин на бесплатном тарифе: держим темп
 		}
 		log.Info("backfill done", zap.String("channel", c.Channel))
 	}

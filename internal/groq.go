@@ -43,7 +43,7 @@ func NewGroqClient(apiKey, model string) *GroqClient {
 	return &GroqClient{
 		apiKey: apiKey,
 		model:  model,
-		http:   &http.Client{Timeout: 25 * time.Second},
+		http:   &http.Client{Timeout: 45 * time.Second},
 	}
 }
 
@@ -118,7 +118,7 @@ type groqResp struct {
 // Parse — разобрать текст объявления в структуру.
 // При упоре в лимит запросов (429) ждём указанное время и повторяем.
 func (g *GroqClient) Parse(ctx context.Context, text string) (*ParsedAd, error) {
-	const maxRetries = 5
+	const maxRetries = 8
 	for attempt := 0; ; attempt++ {
 		res, wait, err := g.parseOnce(ctx, text)
 		if err == nil {
