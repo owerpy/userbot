@@ -105,21 +105,21 @@ func main() {
 		kind := "cargo"
 		// Приводим регионы и кузов к справочнику приложения: в объявлениях
 		// пишут «Samarqand», «Тошкент вилояти», а фильтры ищут «Самарканд».
-		fromRegion, fromCountry := internal.NormalizeRegion(parsed.FromRegion)
-		toRegion, toCountry := internal.NormalizeRegion(parsed.ToRegion)
+		fromRegion, fromCountry := internal.NormalizeRegion(parsed.FromRegion.String())
+		toRegion, toCountry := internal.NormalizeRegion(parsed.ToRegion.String())
 		if fromCountry == "" {
-			fromCountry = parsed.FromCountry
+			fromCountry = parsed.FromCountry.String()
 		}
 		if toCountry == "" {
-			toCountry = parsed.ToCountry
+			toCountry = parsed.ToCountry.String()
 		}
 
 		// Объявление без маршрута и без контакта водителю бесполезно:
 		// в карточке будет пустой заголовок и некому звонить.
 		// Так бывает на постах со списком из пяти направлений сразу —
 		// ИИ не может выбрать один маршрут.
-		phone := internal.NormalizePhone(parsed.ContactPhone)
-		if (fromRegion == "" && toRegion == "") || (phone == "" && parsed.ContactUsername == "") {
+		phone := internal.NormalizePhone(parsed.ContactPhone.String())
+		if (fromRegion == "" && toRegion == "") || (phone == "" && parsed.ContactUsername.String() == "") {
 			return
 		}
 
@@ -129,14 +129,14 @@ func main() {
 			ToRegion:        toRegion,
 			FromCountry:     fromCountry,
 			ToCountry:       toCountry,
-			CargoDesc:       internal.SaneText(parsed.CargoDesc, 80),
-			WeightKg:        internal.SaneWeightKg(parsed.WeightKg),
-			VehicleType:     internal.NormalizeVehicle(parsed.VehicleType),
-			PriceText:       internal.SanePrice(parsed.PriceText),
-			DateText:        internal.SaneText(parsed.DateText, 40),
+			CargoDesc:       internal.SaneText(parsed.CargoDesc.String(), 80),
+			WeightKg:        internal.SaneWeightKg(parsed.WeightKg()),
+			VehicleType:     internal.NormalizeVehicle(parsed.VehicleType.String()),
+			PriceText:       internal.SanePrice(parsed.PriceText.String()),
+			DateText:        internal.SaneText(parsed.DateText.String(), 40),
 			ContactPhone:    phone,
-			ContactUsername: parsed.ContactUsername,
-			Lang:            parsed.Lang,
+			ContactUsername: parsed.ContactUsername.String(),
+			Lang:            parsed.Lang.String(),
 			OriginalText:    p.msg.Message,
 			SourceChannel:   p.src,
 			SourceMsgID:     int64(p.msg.ID),

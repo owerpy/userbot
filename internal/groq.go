@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 	"context"
 	"encoding/json"
@@ -13,22 +14,27 @@ import (
 )
 
 // ParsedAd — то, что ИИ вытащил из текста объявления.
+// Поля берём «гибкими» типами: модели возвращают то число, то строку,
+// а строгий разбор ронял всю пачку объявлений разом.
 type ParsedAd struct {
-	IsAd            bool     `json:"is_ad"`            // вообще ли это объявление о перевозке
-	Kind            string   `json:"kind"`             // "cargo" | "truck"
-	FromRegion      string   `json:"from_region"`      // откуда
-	ToRegion        string   `json:"to_region"`        // куда
-	FromCountry     string   `json:"from_country"`     // страна отправления (если ясно)
-	ToCountry       string   `json:"to_country"`       // страна назначения
-	CargoDesc       string   `json:"cargo_desc"`       // что за груз
-	WeightKg        *float64 `json:"weight_kg"`        // вес в кг (nil если нет)
-	VehicleType     string   `json:"vehicle_type"`     // open/closed/refrigerator/tank/flatbed
-	PriceText       string   `json:"price_text"`       // цена как в тексте
-	DateText        string   `json:"date_text"`        // когда
-	ContactPhone    string   `json:"contact_phone"`    // телефон
-	ContactUsername string   `json:"contact_username"` // @username
-	Lang            string   `json:"lang"`             // uz/ru/kz/other
+	IsAd            bool       `json:"is_ad"`            // вообще ли это объявление о перевозке
+	Kind            string     `json:"kind"`             // "cargo" | "truck"
+	FromRegion      FlexString `json:"from_region"`      // откуда
+	ToRegion        FlexString `json:"to_region"`        // куда
+	FromCountry     FlexString `json:"from_country"`     // страна отправления (если ясно)
+	ToCountry       FlexString `json:"to_country"`       // страна назначения
+	CargoDesc       FlexString `json:"cargo_desc"`       // что за груз
+	Weight          FlexFloat  `json:"weight_kg"`        // вес в кг
+	VehicleType     FlexString `json:"vehicle_type"`     // open/closed/refrigerator/tank/flatbed
+	PriceText       FlexString `json:"price_text"`       // цена как в тексте
+	DateText        FlexString `json:"date_text"`        // когда
+	ContactPhone    FlexString `json:"contact_phone"`    // телефон
+	ContactUsername FlexString `json:"contact_username"` // @username
+	Lang            FlexString `json:"lang"`             // uz/ru/kz/other
 }
+
+// WeightKg — вес в килограммах (nil, если не распознан).
+func (p *ParsedAd) WeightKg() *float64 { return p.Weight.Value }
 
 // У Groq суточная квота считается ОТДЕЛЬНО по каждой модели. Поэтому вместо
 // одной модели держим список: когда у текущей кончается дневной лимит,
@@ -209,6 +215,15 @@ func (g *GroqClient) Parse(ctx context.Context, text string) (*ParsedAd, error) 
 		if err == nil {
 			return res, nil
 		}
+		// Модель не смогла отдать JSON — пробуем следующую в списке.
+		if errors.Is(err, errModelFailed) {
+			next := g.markExhausted(model, 10*time.Minute)
+			if next == "" || attempt >= maxRetries {
+				return nil, err
+			}
+			model = next
+			continue
+		}
 		if wait <= 0 || attempt >= maxRetries {
 			return nil, err
 		}
@@ -245,10 +260,12 @@ func (g *GroqClient) parseOnce(ctx context.Context, text, model string) (*Parsed
 		ResponseFmt: groqRespType{Type: "json_object"},
 		MaxTokens:   500,
 	}
-	// gpt-oss по умолчанию много «размышляет» — на разбор объявления это
-	// лишний расход. Ставим минимальную глубину.
+	// gpt-oss сначала «размышляет», и эти токены тоже идут в лимит ответа.
+	// Если лимит тесный, размышления съедают его целиком и JSON не доходит —
+	// приходит пустой ответ. Поэтому запас увеличиваем.
 	if strings.Contains(model, "gpt-oss") {
 		body.ReasoningEffort = "low"
+		body.MaxTokens = 1500
 	}
 	buf, _ := json.Marshal(body)
 
@@ -277,8 +294,12 @@ func (g *GroqClient) parseOnce(ctx context.Context, text, model string) (*Parsed
 		return nil, 0, fmt.Errorf("groq decode: %w (%s)", err, string(raw))
 	}
 	if gr.Error != nil {
-		if strings.Contains(strings.ToLower(gr.Error.Message), "rate limit") {
+		low := strings.ToLower(gr.Error.Message)
+		if strings.Contains(low, "rate limit") {
 			return nil, retryAfter(resp, gr.Error.Message), fmt.Errorf("groq rate limit")
+		}
+		if strings.Contains(low, "json_validate") || strings.Contains(low, "validate json") {
+			return nil, 0, errModelFailed
 		}
 		return nil, 0, fmt.Errorf("groq error: %s", gr.Error.Message)
 	}
@@ -331,6 +352,10 @@ const batchSuffix = `
 где i — номер объявления из пометки, а остальные поля те же, что описаны выше.
 Обязательно верни запись для КАЖДОГО номера, даже если is_ad=false.`
 
+// errModelFailed — модель не справилась с ответом (не квота).
+// Разумно попробовать другую модель, а не терять объявления.
+var errModelFailed = errors.New("groq: модель вернула некорректный ответ")
+
 type batchResp struct {
 	Ads []struct {
 		Index int `json:"i"`
@@ -366,6 +391,15 @@ func (g *GroqClient) ParseBatch(ctx context.Context, texts []string) ([]*ParsedA
 		out, wait, err := g.parseBatchOnce(ctx, sb.String(), len(texts), model)
 		if err == nil {
 			return out, nil
+		}
+		// Модель не смогла отдать JSON — пробуем следующую в списке.
+		if errors.Is(err, errModelFailed) {
+			next := g.markExhausted(model, 10*time.Minute)
+			if next == "" || attempt >= maxRetries {
+				return nil, err
+			}
+			model = next
+			continue
 		}
 		if wait <= 0 || attempt >= maxRetries {
 			return nil, err
@@ -403,6 +437,7 @@ func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int, m
 	}
 	if strings.Contains(model, "gpt-oss") {
 		body.ReasoningEffort = "low"
+		body.MaxTokens = 400*n + 800 // запас на «размышления»
 	}
 	buf, _ := json.Marshal(body)
 
@@ -430,8 +465,12 @@ func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int, m
 		return nil, 0, fmt.Errorf("groq decode: %w", err)
 	}
 	if gr.Error != nil {
-		if strings.Contains(strings.ToLower(gr.Error.Message), "rate limit") {
+		low := strings.ToLower(gr.Error.Message)
+		if strings.Contains(low, "rate limit") {
 			return nil, retryAfter(resp, gr.Error.Message), fmt.Errorf("groq rate limit")
+		}
+		if strings.Contains(low, "json_validate") || strings.Contains(low, "validate json") {
+			return nil, 0, errModelFailed
 		}
 		return nil, 0, fmt.Errorf("groq error: %s", gr.Error.Message)
 	}
