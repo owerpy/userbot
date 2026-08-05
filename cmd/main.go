@@ -97,10 +97,10 @@ func main() {
 		if p.username != "" {
 			link = fmt.Sprintf("https://t.me/%s/%d", p.username, p.msg.ID)
 		}
-		kind := parsed.Kind
-		if kind != "truck" {
-			kind = "cargo"
-		}
+		// В подключённых каналах публикуют только грузы. То, что ИИ иногда
+		// помечает как «свободная машина», — ошибка классификации, поэтому
+		// фиксируем тип. Логика для свободных машин появится отдельно.
+		kind := "cargo"
 		// Приводим регионы и кузов к справочнику приложения: в объявлениях
 		// пишут «Samarqand», «Тошкент вилояти», а фильтры ищут «Самарканд».
 		fromRegion, fromCountry := internal.NormalizeRegion(parsed.FromRegion)
@@ -110,6 +110,15 @@ func main() {
 		}
 		if toCountry == "" {
 			toCountry = parsed.ToCountry
+		}
+
+		// Объявление без маршрута и без контакта водителю бесполезно:
+		// в карточке будет пустой заголовок и некому звонить.
+		// Так бывает на постах со списком из пяти направлений сразу —
+		// ИИ не может выбрать один маршрут.
+		phone := internal.NormalizePhone(parsed.ContactPhone)
+		if (fromRegion == "" && toRegion == "") || (phone == "" && parsed.ContactUsername == "") {
+			return
 		}
 
 		ins := internal.AdInput{
@@ -123,7 +132,7 @@ func main() {
 			VehicleType:     internal.NormalizeVehicle(parsed.VehicleType),
 			PriceText:       parsed.PriceText,
 			DateText:        parsed.DateText,
-			ContactPhone:    internal.NormalizePhone(parsed.ContactPhone),
+			ContactPhone:    phone,
 			ContactUsername: parsed.ContactUsername,
 			Lang:            parsed.Lang,
 			OriginalText:    p.msg.Message,
