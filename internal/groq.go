@@ -47,7 +47,7 @@ func NewGroqClient(apiKey, model string) *GroqClient {
 	}
 }
 
-const systemPrompt = `Ты — парсер объявлений о грузоперевозках из Telegram-каналов СНГ.
+const systemPromptTmpl = `Ты — парсер объявлений о грузоперевозках из Telegram-каналов СНГ.
 Текст может быть на русском, узбекском (латиница/кириллица) или казахском, в свободной форме.
 
 Верни СТРОГО один JSON-объект без markdown, без пояснений, по схеме:
@@ -76,8 +76,20 @@ const systemPrompt = `Ты — парсер объявлений о грузоп
 - ВАЖНО: cargo_desc и date_text пиши ПО-РУССКИ, даже если объявление на узбекском
   или казахском (интерфейс приложения переводит поля сам, единый язык нужен для
   консистентности). Например: «ertaga» -> «завтра», «qurilish mollari» -> «стройматериалы».
-- from_region/to_region пиши так, как в объявлении — приведением к справочнику
-  занимается приложение.`
+- from_region/to_region ОБЯЗАТЕЛЬНО выбирай ИЗ СПИСКА НИЖЕ (точное написание).
+  Если в объявлении указан город или район — верни ОБЛАСТЬ, к которой он относится.
+  Примеры: «Турткул» -> «Каракалпакстан», «Lutfabod» -> «Бухара»,
+  «Ургенч» -> «Хорезм», «Казань» -> «Татарстан», «Чирчик» -> «Ташкентская область».
+  Если место вне списка (например Стамбул, Минск) — напиши название как есть
+  и укажи страну в from_country/to_country.
+
+ДОПУСТИМЫЕ РЕГИОНЫ:
+%REGIONS%`
+
+// systemPrompt — промпт с подставленным справочником регионов.
+func systemPrompt() string {
+	return strings.ReplaceAll(systemPromptTmpl, "%REGIONS%", RegionsPromptBlock())
+}
 
 type groqReq struct {
 	Model       string       `json:"model"`
@@ -129,7 +141,7 @@ func (g *GroqClient) parseOnce(ctx context.Context, text string) (*ParsedAd, tim
 	body := groqReq{
 		Model: g.model,
 		Messages: []groqMsg{
-			{Role: "system", Content: systemPrompt},
+			{Role: "system", Content: systemPrompt()},
 			{Role: "user", Content: text},
 		},
 		Temperature: 0,
