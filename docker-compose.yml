@@ -1,7 +1,10 @@
 services:
   board-userbot:
-    build: .
-    image: board-userbot:latest
+    # Готовый образ собирается в GitHub Actions — на сервере только pull.
+    # Собрать локально при отладке: docker compose build (см. закомментированное build)
+    image: ghcr.io/owerpy/board-userbot:latest
+    # build: .
+    pull_policy: always
     container_name: board_userbot
     restart: unless-stopped
     env_file: .env
@@ -14,5 +17,5 @@ volumes:
 
 networks:
   truck_net:
-    external: true                 # сеть уже создана стеком truck-delivery
+    external: true
     name: truck-delivery_truck_net

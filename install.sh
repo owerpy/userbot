@@ -49,10 +49,10 @@ ENVEOF
   echo "✅ .env создан"
 fi
 
-# ── 3. Сборка образа ──
+# ── 3. Скачиваем готовый образ (собран в GitHub Actions) ──
 echo ""
-echo "🔨 Собираю образ (первый раз ~2-3 минуты)..."
-sudo docker compose build
+echo "⬇️  Скачиваю образ из GHCR..."
+sudo docker compose pull
 
 # ── 4. Первый вход в Telegram (интерактивно) ──
 echo ""

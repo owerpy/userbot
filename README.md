@@ -1,41 +1,49 @@
 # Board Userbot
 
 Слушает Telegram-каналы под личным аккаунтом-подписчиком, разбирает объявления
-о грузоперевозках через Groq и складывает в таблицу `board_ads` базы Truck Delivery.
-Список каналов берётся из `board_channels` (управляется через админ-API).
+о грузоперевозках через Groq и складывает в `board_ads` базы Truck Delivery.
+Каналы берутся из `board_channels` (управляются в админ-панели → вкладка «Доска»).
 
-## Быстрая установка
+## Как устроен деплой
+
+Образ собирается в **GitHub Actions** и публикуется в GHCR.
+На сервере ничего не компилируется — только скачивается готовый образ.
+
+```
+git push  →  Actions собирает (с кэшем)  →  ghcr.io/owerpy/board-userbot:latest
+                                                    ↓
+                                   на сервере: ./update.sh
+```
+
+## Первая установка
 
 ```bash
-# на сервере, рядом со стеком truck-delivery
 cd /opt
-sudo unzip ~/board-userbot.zip -d board-userbot
-cd board-userbot
+sudo mkdir -p userbot && sudo chown -R $USER:$USER userbot
+git clone https://github.com/owerpy/userbot.git userbot
+cd userbot
 ./install.sh
 ```
 
-Скрипт сам найдёт docker-сеть стека, спросит данные, соберёт образ,
-проведёт вход в Telegram и запустит контейнер.
+Скрипт найдёт docker-сеть стека, спросит данные, создаст `.env`,
+скачает образ, проведёт вход в Telegram и запустит контейнер.
+
+## Обновление (быстро)
+
+```bash
+cd /opt/userbot
+git pull        # только если менялись compose/скрипты
+./update.sh     # скачать свежий образ и перезапустить — секунды
+```
 
 ## Что понадобится
 
 | Что | Где взять |
 |-----|-----------|
 | `TG_APP_ID`, `TG_APP_HASH` | https://my.telegram.org → API development tools |
-| Номер телефона | твой аккаунт, подписанный на нужные каналы |
+| Номер телефона | аккаунт, подписанный на нужные каналы |
 | Пароль Postgres | `POSTGRES_PASSWORD` из `.env` стека truck-delivery |
 | `GROQ_API_KEY` | https://console.groq.com |
-
-## Добавить каналы
-
-Через админ-API бэкенда:
-```
-POST /api/v1/admin/board/channels   {"channel":"@yuk_kanal","title":"Грузы UZ"}
-GET  /api/v1/admin/board/channels
-PATCH /api/v1/admin/board/channels/:id  {"is_active":false}
-DELETE /api/v1/admin/board/channels/:id
-```
-Userbot подхватывает изменения автоматически (проверяет список раз в 2 минуты).
 
 ## Команды
 
@@ -48,6 +56,6 @@ sudo docker compose down                    # остановить
 ## Важно
 
 - Аккаунт должен быть **подписан** на канал (для приватных — состоять в нём).
-- Сессия хранится в томе `board_session` — не удаляй, иначе вход заново.
-- Не подписывайся разом на сотни каналов с одного аккаунта — Telegram может ограничить.
-  Если не хочешь светить основной аккаунт, заведи отдельный под это.
+- Сессия в томе `board_session` — не удаляй, иначе вход заново.
+- Если образ в GHCR приватный, сервер должен быть залогинен:
+  `echo ТОКЕН | sudo docker login ghcr.io -u owerpy --password-stdin`
