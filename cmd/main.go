@@ -390,6 +390,28 @@ func main() {
 			go backfill(ctx, api, store, log, handleNew, &quotaOut)
 		}
 
+		// Telegram присылает не все посты крупных каналов (особенно после
+		// разрывов связи), поэтому дополнительно сами опрашиваем историю.
+		// Уже разобранные посты отсеиваются до обращения к ИИ, так что
+		// повторные проверки ничего не стоят.
+		go func() {
+			every := time.Duration(envInt("BOARD_POLL_SEC", 120)) * time.Second
+			limit := envInt("BOARD_POLL_LIMIT", 20)
+			t := time.NewTicker(every)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if quotaOut.Load() {
+						continue // квота исчерпана — опрашивать бессмысленно
+					}
+					pollChannels(ctx, api, store, log, handleNew, limit)
+				}
+			}
+		}()
+
 		return gaps.Run(ctx, api, self.ID, updates.AuthOptions{
 			OnStart: func(ctx context.Context) {
 				log.Info("listening for channel posts...")
@@ -550,5 +572,68 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 			handle(peer.ChannelID, username, msg)
 		}
 		log.Info("backfill done", zap.String("channel", c.Channel))
+	}
+}
+
+// pollChannels — самостоятельно читает последние посты каналов.
+// Нужен потому, что push-обновления Telegram по крупным каналам приходят
+// не всегда: часть сообщений теряется, и доска перестаёт пополняться.
+// Уже разобранные посты отсеиваются в handle до обращения к ИИ.
+func pollChannels(ctx context.Context, api *tg.Client, store *internal.Store,
+	log *zap.Logger, handle func(int64, string, *tg.Message), limit int) {
+
+	chans, err := store.ActiveChannels(ctx)
+	if err != nil {
+		log.Warn("опрос: не удалось получить список каналов", zap.Error(err))
+		return
+	}
+	for _, c := range chans {
+		uname := strings.TrimPrefix(strings.TrimSpace(c.Channel), "@")
+		if uname == "" {
+			continue
+		}
+		res, err := api.ContactsResolveUsername(ctx, uname)
+		if err != nil {
+			log.Warn("опрос: канал не найден", zap.String("channel", c.Channel), zap.Error(err))
+			continue
+		}
+		var peer *tg.InputPeerChannel
+		var username string
+		for _, ch := range res.Chats {
+			if full, ok := ch.(*tg.Channel); ok {
+				peer = &tg.InputPeerChannel{ChannelID: full.ID, AccessHash: full.AccessHash}
+				username = full.Username
+			}
+		}
+		if peer == nil {
+			continue
+		}
+		hist, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:  peer,
+			Limit: limit,
+		})
+		if err != nil {
+			log.Warn("опрос: не удалось прочитать историю",
+				zap.String("channel", c.Channel), zap.Error(err))
+			continue
+		}
+		msgs, ok := hist.(*tg.MessagesChannelMessages)
+		if !ok {
+			continue
+		}
+		queued := 0
+		for _, m := range msgs.Messages {
+			msg, ok := m.(*tg.Message)
+			if !ok || strings.TrimSpace(msg.Message) == "" {
+				continue
+			}
+			handle(peer.ChannelID, username, msg)
+			queued++
+		}
+		if queued > 0 {
+			log.Debug("опрос канала", zap.String("channel", c.Channel),
+				zap.Int("messages", queued))
+		}
+		time.Sleep(time.Second) // не частим запросами к Telegram
 	}
 }
