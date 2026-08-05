@@ -56,6 +56,19 @@ var regionAliases = map[string]canonRegion{
 	"бекабад":         {"Ташкентская область", "UZ"},
 	"yangiyol":        {"Ташкентская область", "UZ"},
 	"янгиюль":         {"Ташкентская область", "UZ"},
+	"фаргона":         {"Фергана", "UZ"},
+	"фаргонa":         {"Фергана", "UZ"},
+	"қуқон":           {"Фергана", "UZ"},
+	"андижан":         {"Андижан", "UZ"},
+	"наманган":        {"Наманган", "UZ"},
+	"жиззак":          {"Джизак", "UZ"},
+	"жиззах":          {"Джизак", "UZ"},
+	"сурхандарё":      {"Сурхандарья", "UZ"},
+	"қашқадарья":      {"Кашкадарья", "UZ"},
+	"тошкент":         {"Ташкент", "UZ"},
+	"тошкентвилояти":  {"Ташкентская область", "UZ"},
+	"минск":           {"", "BY"},
+	"беларусь":        {"", "BY"},
 	"samarqand":        {"Самарканд", "UZ"},
 	"samarkand":        {"Самарканд", "UZ"},
 	"самарканд":        {"Самарканд", "UZ"},
@@ -262,6 +275,12 @@ func regionKey(s string) string {
 	return b.String()
 }
 
+// notRegions — слова, которые ИИ иногда принимает за регион.
+var notRegions = map[string]bool{
+	"водий": true, "vodiy": true, "долина": true,
+	"вилоят": true, "viloyat": true, "область": true, "регион": true,
+}
+
 // NormalizeRegion приводит регион к справочнику приложения.
 // Возвращает канон и код страны; если не распознали — исходную строку.
 func NormalizeRegion(raw string) (region string, country string) {
@@ -269,7 +288,11 @@ func NormalizeRegion(raw string) (region string, country string) {
 	if raw == "" {
 		return "", ""
 	}
-	if c, ok := regionAliases[regionKey(raw)]; ok {
+	key := regionKey(raw)
+	if notRegions[key] {
+		return "", ""
+	}
+	if c, ok := regionAliases[key]; ok {
 		return c.Region, c.Country
 	}
 	// иногда приходит «Ташкент — Самарканд» одной строкой: берём первое слово
@@ -392,4 +415,50 @@ func LooksLikeAd(text string) bool {
 		}
 	}
 	return true
+}
+
+// NormalizePhone приводит телефон к международному виду, иначе кнопка
+// «Позвонить» в приложении не сработает: в объявлениях пишут по-разному —
+// «914679108», «90 123 45 67», «+998 90 1234567».
+func NormalizePhone(raw string) string {
+	digits := make([]rune, 0, 16)
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			digits = append(digits, r)
+		}
+	}
+	d := string(digits)
+	switch {
+	case d == "":
+		return ""
+	case len(d) == 9: // 901234567 — узбекский без кода
+		return "+998" + d
+	case len(d) == 12 && strings.HasPrefix(d, "998"):
+		return "+" + d
+	case len(d) == 11 && (strings.HasPrefix(d, "7") || strings.HasPrefix(d, "8")):
+		// российский/казахстанский: 8XXXXXXXXXX → +7XXXXXXXXXX
+		return "+7" + d[1:]
+	case len(d) >= 10 && len(d) <= 15:
+		return "+" + d
+	default:
+		return "" // мусор вроде «2 ta» или обрывок номера
+	}
+}
+
+// SaneWeightKg отбрасывает явно неверный вес: фура везёт до ~40 тонн,
+// «500 тонн» — это ошибка разбора, а не реальный груз.
+func SaneWeightKg(w *float64) *float64 {
+	if w == nil {
+		return nil
+	}
+	v := *w
+	if v <= 0 || v > 60000 {
+		return nil
+	}
+	// «20» вместо «20000» — в объявлениях вес почти всегда в тоннах
+	if v < 100 {
+		t := v * 1000
+		return &t
+	}
+	return w
 }
