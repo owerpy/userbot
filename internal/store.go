@@ -101,3 +101,14 @@ func ns(s string) any {
 	}
 	return s
 }
+
+// AdExists — объявление из этого сообщения уже сохранено?
+// Проверяем ДО вызова ИИ, чтобы при перезапуске не тратить лимит Groq
+// на посты, которые уже разобраны.
+func (s *Store) AdExists(ctx context.Context, channel string, msgID int64) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM board_ads WHERE source_channel=$1 AND source_msg_id=$2)`,
+		channel, msgID).Scan(&exists)
+	return exists, err
+}

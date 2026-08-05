@@ -81,9 +81,24 @@ func main() {
 		if !watched.Match(peerChannelID, username) {
 			return
 		}
+
+		// Уже разбирали этот пост? Тогда не тратим лимит Groq впустую
+		// (важно при перезапусках: backfill каждый раз перечитывает историю).
+		srcName := username
+		if srcName == "" {
+			srcName = fmt.Sprintf("channel_%d", peerChannelID)
+		}
+		srcName = "@" + strings.TrimPrefix(srcName, "@")
+		ectx, ecancel := context.WithTimeout(context.Background(), 5*time.Second)
+		already, _ := store.AdExists(ectx, srcName, int64(msg.ID))
+		ecancel()
+		if already {
+			return
+		}
+
 		// разбираем через ИИ
 		// Запас на повторы при лимите Groq (он просит ждать по 3-6 сек).
-		pctx, pcancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer pcancel()
 		parsed, err := groq.Parse(pctx, text)
 		if err != nil {
@@ -92,10 +107,6 @@ func main() {
 		}
 		if !parsed.IsAd {
 			return // не объявление — пропускаем
-		}
-		src := username
-		if src == "" {
-			src = fmt.Sprintf("channel_%d", peerChannelID)
 		}
 		link := ""
 		if username != "" {
@@ -132,7 +143,7 @@ func main() {
 			ContactUsername: parsed.ContactUsername,
 			Lang:            parsed.Lang,
 			OriginalText:    text,
-			SourceChannel:   "@" + strings.TrimPrefix(src, "@"),
+			SourceChannel:   srcName,
 			SourceMsgID:     int64(msg.ID),
 			SourceLink:      link,
 			PostedAt:        time.Unix(int64(msg.Date), 0),
@@ -365,7 +376,7 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 				continue
 			}
 			handle(peer.ChannelID, username, msg)
-			time.Sleep(4 * time.Second) // ~12k токенов/мин на бесплатном тарифе: держим темп
+			time.Sleep(7 * time.Second) // ~1000 токенов на объявление при лимите 12k/мин
 		}
 		log.Info("backfill done", zap.String("channel", c.Channel))
 	}

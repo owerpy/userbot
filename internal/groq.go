@@ -127,10 +127,14 @@ func (g *GroqClient) Parse(ctx context.Context, text string) (*ParsedAd, error) 
 		if wait <= 0 || attempt >= maxRetries {
 			return nil, err
 		}
-		// подождать столько, сколько попросил Groq (+ небольшой запас)
+		// Не ждём дольше, чем осталось в контексте — иначе получим
+		// невнятное «context deadline exceeded» вместо причины.
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+time.Second {
+			return nil, fmt.Errorf("groq rate limit: нужно ждать %s, не укладываемся", wait)
+		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("groq: %w (лимит просил ждать %s)", ctx.Err(), wait)
 		case <-time.After(wait + 500*time.Millisecond):
 		}
 	}
