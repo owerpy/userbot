@@ -539,3 +539,61 @@ func SaneWeightKg(w *float64) *float64 {
 	}
 	return w
 }
+
+// SanePrice отсеивает мусор в поле цены. Слабые модели пишут туда
+// количество машин («2 ta kerak»), вес или обрывки текста.
+// Настоящая цена — это сумма с валютой либо явная пометка «договорная».
+func SanePrice(raw string) string {
+	t := strings.TrimSpace(raw)
+	if t == "" {
+		return ""
+	}
+	low := strings.ToLower(t)
+
+	// договорная в разных написаниях
+	for _, w := range []string{"договор", "kelish", "келиш", "narxi kelish", "по договор"} {
+		if strings.Contains(low, w) {
+			return "договорная"
+		}
+	}
+	// должна быть цифра
+	hasDigit := false
+	for _, r := range low {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return ""
+	}
+	// и признак денег
+	for _, cur := range []string{
+		"$", "usd", "долл", "сум", "so'm", "som", "soum", "руб", "rub",
+		"тенге", "tenge", "млн", "mln", "ming", "тыс", "евро", "eur",
+	} {
+		if strings.Contains(low, cur) {
+			return t
+		}
+	}
+	// «750» без валюты — в объявлениях так пишут цену в долларах
+	if len(low) <= 8 && !strings.ContainsAny(low, "тtшмашина") {
+		return t
+	}
+	return ""
+}
+
+// SaneText обрезает поля, куда модель иногда вываливает пол-объявления
+// (описание груза, дату). В карточке это ломает вёрстку.
+func SaneText(raw string, maxRunes int) string {
+	t := strings.TrimSpace(raw)
+	// многострочный ответ — берём первую строку
+	if i := strings.IndexAny(t, "\n\r"); i > 0 {
+		t = strings.TrimSpace(t[:i])
+	}
+	r := []rune(t)
+	if len(r) > maxRunes {
+		return strings.TrimSpace(string(r[:maxRunes]))
+	}
+	return t
+}

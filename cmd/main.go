@@ -54,6 +54,8 @@ func main() {
 	}
 	defer store.Close()
 	groq := internal.NewGroqClient(groqKey, groqModel)
+	log.Info("модели Groq (переключаемся при исчерпании суточной квоты)",
+		zap.Strings("models", groq.Models()))
 
 	// ── обработчик новых сообщений в каналах ──
 	d := tg.NewUpdateDispatcher()
@@ -127,11 +129,11 @@ func main() {
 			ToRegion:        toRegion,
 			FromCountry:     fromCountry,
 			ToCountry:       toCountry,
-			CargoDesc:       parsed.CargoDesc,
+			CargoDesc:       internal.SaneText(parsed.CargoDesc, 80),
 			WeightKg:        internal.SaneWeightKg(parsed.WeightKg),
 			VehicleType:     internal.NormalizeVehicle(parsed.VehicleType),
-			PriceText:       parsed.PriceText,
-			DateText:        parsed.DateText,
+			PriceText:       internal.SanePrice(parsed.PriceText),
+			DateText:        internal.SaneText(parsed.DateText, 40),
 			ContactPhone:    phone,
 			ContactUsername: parsed.ContactUsername,
 			Lang:            parsed.Lang,
@@ -188,10 +190,11 @@ func main() {
 
 		parsed, err := groq.ParseBatch(pctx, texts)
 		if err != nil {
-			if strings.Contains(err.Error(), "не укладываемся") {
+			if strings.Contains(err.Error(), "не укладываемся") ||
+				strings.Contains(err.Error(), "исчерпана у всех") {
 				if quotaOut.CompareAndSwap(false, true) {
-					log.Warn("дневная квота Groq исчерпана — разбор приостановлен, "+
-						"возобновится после сброса лимита", zap.Error(err))
+					log.Warn("суточная квота исчерпана у всех моделей — разбор "+
+						"приостановлен, возобновится после сброса лимита", zap.Error(err))
 				}
 				return
 			}
@@ -227,9 +230,9 @@ func main() {
 	go func() {
 		batchSize := envInt("BOARD_BATCH_SIZE", 8)
 		batchWait := time.Duration(envInt("BOARD_BATCH_WAIT_SEC", 20)) * time.Second
-		// Минутный лимит токенов у модели небольшой (8000 у gpt-oss-120b),
-		// поэтому пачку ограничиваем ещё и по объёму, а не только по числу.
-		maxTokens := envInt("BOARD_BATCH_MAX_TOKENS", 3500)
+		// Предел объёма пачки: по умолчанию считаем от минутного лимита
+		// текущей модели (он разный), но можно задать вручную через env.
+		fixedMax := envInt("BOARD_BATCH_MAX_TOKENS", 0)
 		pause := backfillPause()
 
 		batch := make([]pending, 0, batchSize)
@@ -244,6 +247,10 @@ func main() {
 			case p := <-queue:
 				batch = append(batch, p)
 				batchTokens += estTokens(clipText(p.msg.Message))
+				maxTokens := fixedMax
+				if maxTokens == 0 {
+					maxTokens = groq.MaxBatchTokens()
+				}
 				if len(batch) >= batchSize || batchTokens >= maxTokens {
 					flush(batch)
 					batch = batch[:0]

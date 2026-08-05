@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bytes"
+	"sync"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -29,24 +30,83 @@ type ParsedAd struct {
 	Lang            string   `json:"lang"`             // uz/ru/kz/other
 }
 
+// У Groq суточная квота считается ОТДЕЛЬНО по каждой модели. Поэтому вместо
+// одной модели держим список: когда у текущей кончается дневной лимит,
+// переключаемся на следующую, а первую пробуем снова после сброса.
+// Так на одном аккаунте суммарно доступно в несколько раз больше токенов.
 type GroqClient struct {
 	apiKey string
-	model  string
+	models []string
 	http   *http.Client
+
+	mu        sync.Mutex
+	current   int
+	exhausted map[string]time.Time // модель → когда снова пробовать
 }
 
+// NewGroqClient принимает одну модель или несколько через запятую.
 func NewGroqClient(apiKey, model string) *GroqClient {
-	if model == "" {
-		// Баланс точности и суточной квоты на бесплатном тарифе Groq
-		// (200k токенов/сутки против 100k у llama-3.3-70b).
-		model = "openai/gpt-oss-120b"
+	var models []string
+	for _, m := range strings.Split(model, ",") {
+		if m = strings.TrimSpace(m); m != "" {
+			models = append(models, m)
+		}
+	}
+	if len(models) == 0 {
+		// По умолчанию — цепочка от самой точной к самой ёмкой по квоте.
+		// Порядок: сначала самая точная, дальше по убыванию качества
+		// (но по возрастанию доступной суточной квоты).
+		models = []string{
+			"llama-3.3-70b-versatile", // точнее всех, 100k/сутки
+			"openai/gpt-oss-120b",     // почти так же точно, 200k/сутки
+			"llama-3.1-8b-instant",    // слабее, но квота самая большая
+		}
 	}
 	return &GroqClient{
-		apiKey: apiKey,
-		model:  model,
-		http:   &http.Client{Timeout: 45 * time.Second},
+		apiKey:    apiKey,
+		models:    models,
+		http:      &http.Client{Timeout: 45 * time.Second},
+		exhausted: map[string]time.Time{},
 	}
 }
+
+// activeModel — текущая модель, у которой не исчерпана суточная квота.
+func (g *GroqClient) activeModel() (string, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	for i := 0; i < len(g.models); i++ {
+		idx := (g.current + i) % len(g.models)
+		m := g.models[idx]
+		if until, bad := g.exhausted[m]; bad && now.Before(until) {
+			continue
+		}
+		delete(g.exhausted, m)
+		g.current = idx
+		return m, true
+	}
+	return "", false // все модели исчерпаны
+}
+
+// markExhausted — у модели кончилась дневная квота, вернёмся к ней позже.
+func (g *GroqClient) markExhausted(model string, retryAfter time.Duration) string {
+	g.mu.Lock()
+	if retryAfter < time.Minute {
+		retryAfter = time.Minute
+	}
+	g.exhausted[model] = time.Now().Add(retryAfter)
+	g.current = (g.current + 1) % len(g.models)
+	g.mu.Unlock()
+
+	next, ok := g.activeModel()
+	if !ok {
+		return ""
+	}
+	return next
+}
+
+// Models — список моделей (для логов).
+func (g *GroqClient) Models() []string { return g.models }
 
 const systemPromptTmpl = `Ты — парсер объявлений о грузоперевозках из Telegram-каналов СНГ.
 Текст может быть на русском, узбекском (латиница/кириллица) или казахском, в свободной форме.
@@ -140,17 +200,29 @@ type groqResp struct {
 // При упоре в лимит запросов (429) ждём указанное время и повторяем.
 func (g *GroqClient) Parse(ctx context.Context, text string) (*ParsedAd, error) {
 	const maxRetries = 8
+	model, ok := g.activeModel()
+	if !ok {
+		return nil, fmt.Errorf("groq: суточная квота исчерпана у всех моделей")
+	}
 	for attempt := 0; ; attempt++ {
-		res, wait, err := g.parseOnce(ctx, text)
+		res, wait, err := g.parseOnce(ctx, text, model)
 		if err == nil {
 			return res, nil
 		}
 		if wait <= 0 || attempt >= maxRetries {
 			return nil, err
 		}
-		// Не ждём дольше, чем осталось в контексте — иначе получим
-		// невнятное «context deadline exceeded» вместо причины.
-		if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+time.Second {
+		// Ждать больше двух минут = кончилась дневная квота этой модели.
+		// Переключаемся на следующую, а к этой вернёмся после сброса.
+		if wait > 2*time.Minute {
+			next := g.markExhausted(model, wait)
+			if next == "" {
+				return nil, fmt.Errorf("groq: квота исчерпана у всех моделей (ждать %s)", wait)
+			}
+			model = next
+			continue
+		}
+		if dl, okd := ctx.Deadline(); okd && time.Until(dl) < wait+time.Second {
 			return nil, fmt.Errorf("groq rate limit: нужно ждать %s, не укладываемся", wait)
 		}
 		select {
@@ -162,9 +234,9 @@ func (g *GroqClient) Parse(ctx context.Context, text string) (*ParsedAd, error) 
 }
 
 // parseOnce — одна попытка. Возвращает время ожидания, если сработал лимит.
-func (g *GroqClient) parseOnce(ctx context.Context, text string) (*ParsedAd, time.Duration, error) {
+func (g *GroqClient) parseOnce(ctx context.Context, text, model string) (*ParsedAd, time.Duration, error) {
 	body := groqReq{
-		Model: g.model,
+		Model: model,
 		Messages: []groqMsg{
 			{Role: "system", Content: systemPrompt()},
 			{Role: "user", Content: text},
@@ -175,7 +247,7 @@ func (g *GroqClient) parseOnce(ctx context.Context, text string) (*ParsedAd, tim
 	}
 	// gpt-oss по умолчанию много «размышляет» — на разбор объявления это
 	// лишний расход. Ставим минимальную глубину.
-	if strings.Contains(g.model, "gpt-oss") {
+	if strings.Contains(model, "gpt-oss") {
 		body.ReasoningEffort = "low"
 	}
 	buf, _ := json.Marshal(body)
@@ -286,15 +358,28 @@ func (g *GroqClient) ParseBatch(ctx context.Context, texts []string) ([]*ParsedA
 	}
 
 	const maxRetries = 8
+	model, ok := g.activeModel()
+	if !ok {
+		return nil, fmt.Errorf("groq: суточная квота исчерпана у всех моделей")
+	}
 	for attempt := 0; ; attempt++ {
-		out, wait, err := g.parseBatchOnce(ctx, sb.String(), len(texts))
+		out, wait, err := g.parseBatchOnce(ctx, sb.String(), len(texts), model)
 		if err == nil {
 			return out, nil
 		}
 		if wait <= 0 || attempt >= maxRetries {
 			return nil, err
 		}
-		if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+time.Second {
+		// Дневная квота модели кончилась — переходим к следующей.
+		if wait > 2*time.Minute {
+			next := g.markExhausted(model, wait)
+			if next == "" {
+				return nil, fmt.Errorf("groq: квота исчерпана у всех моделей (ждать %s)", wait)
+			}
+			model = next
+			continue
+		}
+		if dl, okd := ctx.Deadline(); okd && time.Until(dl) < wait+time.Second {
 			return nil, fmt.Errorf("groq rate limit: нужно ждать %s, не укладываемся", wait)
 		}
 		select {
@@ -305,9 +390,9 @@ func (g *GroqClient) ParseBatch(ctx context.Context, texts []string) ([]*ParsedA
 	}
 }
 
-func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int) ([]*ParsedAd, time.Duration, error) {
+func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int, model string) ([]*ParsedAd, time.Duration, error) {
 	body := groqReq{
-		Model: g.model,
+		Model: model,
 		Messages: []groqMsg{
 			{Role: "system", Content: systemPrompt() + batchSuffix},
 			{Role: "user", Content: joined},
@@ -316,7 +401,7 @@ func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int) (
 		ResponseFmt: groqRespType{Type: "json_object"},
 		MaxTokens:   250 * n,
 	}
-	if strings.Contains(g.model, "gpt-oss") {
+	if strings.Contains(model, "gpt-oss") {
 		body.ReasoningEffort = "low"
 	}
 	buf, _ := json.Marshal(body)
@@ -375,4 +460,32 @@ func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int) (
 		out[idx] = &ad
 	}
 	return out, 0, nil
+}
+
+// Минутный лимит токенов различается по моделям, поэтому размер пачки
+// подбираем под ту, которая работает сейчас, — иначе на модели послабее
+// запрос не влезет и объявления потеряются.
+var modelTPM = map[string]int{
+	"llama-3.3-70b-versatile": 12000,
+	"openai/gpt-oss-120b":     8000,
+	"llama-3.1-8b-instant":    6000,
+}
+
+// MaxBatchTokens — сколько токенов текста можно положить в одну пачку.
+// Оставляем запас на системный промпт и на ответ модели.
+func (g *GroqClient) MaxBatchTokens() int {
+	m, ok := g.activeModel()
+	if !ok {
+		return 1500
+	}
+	tpm := modelTPM[m]
+	if tpm == 0 {
+		tpm = 6000 // незнакомая модель — считаем по самой скромной
+	}
+	const promptTokens = 900 // системный промпт со справочником регионов
+	budget := tpm/2 - promptTokens
+	if budget < 1200 {
+		budget = 1200
+	}
+	return budget
 }
