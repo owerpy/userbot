@@ -148,14 +148,31 @@ func main() {
 		}
 	}
 
-	// разобрать накопленную пачку
+	// estTokens — грубая оценка: для смеси кириллицы и латиницы
+	// примерно один токен на три символа.
+	estTokens := func(text string) int {
+		return len([]rune(text))/3 + 40
+	}
+	// clipText — очень длинные посты (списки на десятки строк) режем:
+	// объявление всегда в начале, а хвост только съедает лимит.
+	clipText := func(text string) string {
+		const maxRunes = 1200
+		r := []rune(text)
+		if len(r) <= maxRunes {
+			return text
+		}
+		return string(r[:maxRunes])
+	}
+
+	// разобрать накопленную пачку (flushRef нужен для рекурсии при делении)
+	var flushRef func([]pending)
 	flush := func(batch []pending) {
 		if len(batch) == 0 {
 			return
 		}
 		texts := make([]string, len(batch))
 		for i, p := range batch {
-			texts[i] = p.msg.Message
+			texts[i] = clipText(p.msg.Message)
 		}
 		pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer pcancel()
@@ -167,6 +184,16 @@ func main() {
 					log.Warn("дневная квота Groq исчерпана — разбор приостановлен, "+
 						"возобновится после сброса лимита", zap.Error(err))
 				}
+				return
+			}
+			// Пачка не влезла в минутный лимит — делим пополам и пробуем снова,
+			// иначе потеряли бы все объявления из неё.
+			if strings.Contains(err.Error(), "too large") && len(batch) > 1 {
+				mid := len(batch) / 2
+				log.Info("пачка велика — делим", zap.Int("size", len(batch)))
+				flushRef(batch[:mid])
+				time.Sleep(2 * time.Second)
+				flushRef(batch[mid:])
 				return
 			}
 			log.Warn("groq parse batch", zap.Error(err), zap.Int("size", len(batch)))
@@ -185,14 +212,19 @@ func main() {
 		}
 		log.Info("batch parsed", zap.Int("posts", len(batch)), zap.Int("ads", added))
 	}
+	flushRef = flush
 
 	// воркер: копит до batchSize постов либо до batchWait, потом разбирает
 	go func() {
-		batchSize := envInt("BOARD_BATCH_SIZE", 10)
+		batchSize := envInt("BOARD_BATCH_SIZE", 8)
 		batchWait := time.Duration(envInt("BOARD_BATCH_WAIT_SEC", 20)) * time.Second
+		// Минутный лимит токенов у модели небольшой (8000 у gpt-oss-120b),
+		// поэтому пачку ограничиваем ещё и по объёму, а не только по числу.
+		maxTokens := envInt("BOARD_BATCH_MAX_TOKENS", 3500)
 		pause := backfillPause()
 
 		batch := make([]pending, 0, batchSize)
+		batchTokens := 0
 		timer := time.NewTimer(batchWait)
 		defer timer.Stop()
 
@@ -202,9 +234,11 @@ func main() {
 				return
 			case p := <-queue:
 				batch = append(batch, p)
-				if len(batch) >= batchSize {
+				batchTokens += estTokens(clipText(p.msg.Message))
+				if len(batch) >= batchSize || batchTokens >= maxTokens {
 					flush(batch)
 					batch = batch[:0]
+					batchTokens = 0
 					time.Sleep(pause) // держим темп под минутный лимит токенов
 					if !timer.Stop() {
 						select {
@@ -218,6 +252,7 @@ func main() {
 				if len(batch) > 0 {
 					flush(batch)
 					batch = batch[:0]
+					batchTokens = 0
 					time.Sleep(pause)
 				}
 				timer.Reset(batchWait)
