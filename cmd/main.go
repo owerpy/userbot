@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"context"
 	"fmt"
 	"os"
@@ -73,44 +74,28 @@ func main() {
 		}
 	}()
 
-	handleNew := func(peerChannelID int64, username string, msg *tg.Message) {
-		text := msg.Message
-		if strings.TrimSpace(text) == "" {
-			return
-		}
-		if !watched.Match(peerChannelID, username) {
-			return
-		}
+	// Когда дневная квота Groq выбита, ждать бессмысленно — помечаем и
+	// прекращаем первичную загрузку, чтобы не сыпать ошибками в лог.
+	var quotaOut atomic.Bool
 
-		// Уже разбирали этот пост? Тогда не тратим лимит Groq впустую
-		// (важно при перезапусках: backfill каждый раз перечитывает историю).
-		srcName := username
-		if srcName == "" {
-			srcName = fmt.Sprintf("channel_%d", peerChannelID)
-		}
-		srcName = "@" + strings.TrimPrefix(srcName, "@")
-		ectx, ecancel := context.WithTimeout(context.Background(), 5*time.Second)
-		already, _ := store.AdExists(ectx, srcName, int64(msg.ID))
-		ecancel()
-		if already {
-			return
-		}
+	// Очередь: посты копятся и уходят в ИИ пачками. Системный промпт
+	// (со справочником регионов) — самая тяжёлая часть запроса, и в пачке
+	// он оплачивается один раз на все объявления сразу.
+	type pending struct {
+		src      string
+		username string
+		msg      *tg.Message
+	}
+	queue := make(chan pending, 512)
 
-		// разбираем через ИИ
-		// Запас на повторы при лимите Groq (он просит ждать по 3-6 сек).
-		pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer pcancel()
-		parsed, err := groq.Parse(pctx, text)
-		if err != nil {
-			log.Warn("groq parse", zap.Error(err))
+	// сохранить одно разобранное объявление
+	saveAd := func(p pending, parsed *internal.ParsedAd) {
+		if parsed == nil || !parsed.IsAd {
 			return
-		}
-		if !parsed.IsAd {
-			return // не объявление — пропускаем
 		}
 		link := ""
-		if username != "" {
-			link = fmt.Sprintf("https://t.me/%s/%d", username, msg.ID)
+		if p.username != "" {
+			link = fmt.Sprintf("https://t.me/%s/%d", p.username, p.msg.ID)
 		}
 		kind := parsed.Kind
 		if kind != "truck" {
@@ -126,7 +111,6 @@ func main() {
 		if toCountry == "" {
 			toCountry = parsed.ToCountry
 		}
-		vehType := internal.NormalizeVehicle(parsed.VehicleType)
 
 		ins := internal.AdInput{
 			Kind:            kind,
@@ -136,28 +120,146 @@ func main() {
 			ToCountry:       toCountry,
 			CargoDesc:       parsed.CargoDesc,
 			WeightKg:        parsed.WeightKg,
-			VehicleType:     vehType,
+			VehicleType:     internal.NormalizeVehicle(parsed.VehicleType),
 			PriceText:       parsed.PriceText,
 			DateText:        parsed.DateText,
 			ContactPhone:    parsed.ContactPhone,
 			ContactUsername: parsed.ContactUsername,
 			Lang:            parsed.Lang,
-			OriginalText:    text,
-			SourceChannel:   srcName,
-			SourceMsgID:     int64(msg.ID),
+			OriginalText:    p.msg.Message,
+			SourceChannel:   p.src,
+			SourceMsgID:     int64(p.msg.ID),
 			SourceLink:      link,
-			PostedAt:        time.Unix(int64(msg.Date), 0),
+			PostedAt:        time.Unix(int64(p.msg.Date), 0),
 		}
 		ictx, icancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer icancel()
 		ok, err := store.InsertAd(ictx, ins)
 		if err != nil {
-			log.Warn("insert ad", zap.Error(err))
+			// дубль по тексту ловится уникальным индексом — это не ошибка
+			if !strings.Contains(err.Error(), "uq_board_ads_texthash") {
+				log.Warn("insert ad", zap.Error(err))
+			}
 			return
 		}
 		if ok {
 			log.Info("ad added", zap.String("route", fromRegion+"→"+toRegion),
 				zap.String("kind", kind), zap.String("src", ins.SourceChannel))
+		}
+	}
+
+	// разобрать накопленную пачку
+	flush := func(batch []pending) {
+		if len(batch) == 0 {
+			return
+		}
+		texts := make([]string, len(batch))
+		for i, p := range batch {
+			texts[i] = p.msg.Message
+		}
+		pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer pcancel()
+
+		parsed, err := groq.ParseBatch(pctx, texts)
+		if err != nil {
+			if strings.Contains(err.Error(), "не укладываемся") {
+				if quotaOut.CompareAndSwap(false, true) {
+					log.Warn("дневная квота Groq исчерпана — разбор приостановлен, "+
+						"возобновится после сброса лимита", zap.Error(err))
+				}
+				return
+			}
+			log.Warn("groq parse batch", zap.Error(err), zap.Int("size", len(batch)))
+			return
+		}
+		quotaOut.Store(false)
+
+		added := 0
+		for i, p := range batch {
+			if i < len(parsed) && parsed[i] != nil && parsed[i].IsAd {
+				added++
+			}
+			if i < len(parsed) {
+				saveAd(p, parsed[i])
+			}
+		}
+		log.Info("batch parsed", zap.Int("posts", len(batch)), zap.Int("ads", added))
+	}
+
+	// воркер: копит до batchSize постов либо до batchWait, потом разбирает
+	go func() {
+		batchSize := envInt("BOARD_BATCH_SIZE", 10)
+		batchWait := time.Duration(envInt("BOARD_BATCH_WAIT_SEC", 20)) * time.Second
+		pause := backfillPause()
+
+		batch := make([]pending, 0, batchSize)
+		timer := time.NewTimer(batchWait)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case p := <-queue:
+				batch = append(batch, p)
+				if len(batch) >= batchSize {
+					flush(batch)
+					batch = batch[:0]
+					time.Sleep(pause) // держим темп под минутный лимит токенов
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(batchWait)
+				}
+			case <-timer.C:
+				if len(batch) > 0 {
+					flush(batch)
+					batch = batch[:0]
+					time.Sleep(pause)
+				}
+				timer.Reset(batchWait)
+			}
+		}
+	}()
+
+	handleNew := func(peerChannelID int64, username string, msg *tg.Message) {
+		text := msg.Message
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		if !watched.Match(peerChannelID, username) {
+			return
+		}
+		// Грубый отсев до ИИ: приветствия, реклама, подписи к картинкам.
+		if !internal.LooksLikeAd(text) {
+			return
+		}
+
+		srcName := username
+		if srcName == "" {
+			srcName = fmt.Sprintf("channel_%d", peerChannelID)
+		}
+		srcName = "@" + strings.TrimPrefix(srcName, "@")
+
+		// Уже разбирали этот пост или такой же текст (каналы часто
+		// перепубликуют одно объявление)? Тогда ИИ не беспокоим.
+		ectx, ecancel := context.WithTimeout(context.Background(), 5*time.Second)
+		already, _ := store.AdExists(ectx, srcName, int64(msg.ID))
+		if !already {
+			already, _ = store.TextExists(ectx, text)
+		}
+		ecancel()
+		if already {
+			return
+		}
+
+		select {
+		case queue <- pending{src: srcName, username: username, msg: msg}:
+		default:
+			log.Warn("очередь переполнена, пост пропущен", zap.Int("msg_id", msg.ID))
 		}
 	}
 
@@ -234,7 +336,7 @@ func main() {
 		// Первичная загрузка: читаем последние посты каналов, чтобы доска
 		// не была пустой до появления новых сообщений.
 		if os.Getenv("BOARD_BACKFILL") != "0" {
-			go backfill(ctx, api, store, log, handleNew)
+			go backfill(ctx, api, store, log, handleNew, &quotaOut)
 		}
 
 		return gaps.Run(ctx, api, self.ID, updates.AuthOptions{
@@ -319,10 +421,27 @@ func resolveWatched(ctx context.Context, api *tg.Client, store *internal.Store,
 	}
 }
 
+// envInt — целое из переменной окружения с запасным значением.
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// backfillPause — пауза между пачками (держим минутный лимит токенов).
+// Настраивается через BOARD_BATCH_PAUSE_SEC (по умолчанию 10 сек).
+func backfillPause() time.Duration {
+	return time.Duration(envInt("BOARD_BATCH_PAUSE_SEC", 10)) * time.Second
+}
+
 // backfill — разовая подгрузка последних постов каналов при старте,
 // чтобы доска сразу наполнилась, а не ждала новых сообщений.
 func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
-	log *zap.Logger, handle func(int64, string, *tg.Message)) {
+	log *zap.Logger, handle func(int64, string, *tg.Message), quotaOut *atomic.Bool) {
 
 	time.Sleep(3 * time.Second) // дать резолву отработать
 
@@ -330,10 +449,7 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 	if err != nil {
 		return
 	}
-	limit := 15
-	if v := os.Getenv("BOARD_BACKFILL_LIMIT"); v != "" {
-		fmt.Sscanf(v, "%d", &limit)
-	}
+	limit := envInt("BOARD_BACKFILL_LIMIT", 30)
 
 	for _, c := range chans {
 		uname := strings.TrimPrefix(strings.TrimSpace(c.Channel), "@")
@@ -375,8 +491,12 @@ func backfill(ctx context.Context, api *tg.Client, store *internal.Store,
 			if !ok || strings.TrimSpace(msg.Message) == "" {
 				continue
 			}
+			if quotaOut.Load() {
+				log.Warn("первичная загрузка остановлена: квота Groq исчерпана")
+				return
+			}
+			// Просто кладём в очередь — темп и пачки держит воркер.
 			handle(peer.ChannelID, username, msg)
-			time.Sleep(7 * time.Second) // ~1000 токенов на объявление при лимите 12k/мин
 		}
 		log.Info("backfill done", zap.String("channel", c.Channel))
 	}

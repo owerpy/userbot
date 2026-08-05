@@ -361,3 +361,35 @@ func RegionsPromptBlock() string {
 	}
 	return b.String()
 }
+
+// LooksLikeAd — грубый отсев до обращения к ИИ.
+// В каналах много постов, которые заведомо не объявления: приветствия,
+// реклама, подписи к картинкам. Гонять их через ИИ — впустую жечь квоту.
+func LooksLikeAd(text string) bool {
+	t := strings.TrimSpace(text)
+	if len([]rune(t)) < 20 {
+		return false
+	}
+	// В настоящем объявлении почти всегда есть цифры: тонны, дата, телефон.
+	hasDigit := false
+	for _, r := range t {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return false
+	}
+	// Явный рекламный мусор
+	low := strings.ToLower(t)
+	for _, bad := range []string{
+		"reklama", "реклама", "obuna", "подпишись", "subscribe",
+		"kanalga", "@admin yozing", "narx kelishilgan holda emas",
+	} {
+		if strings.Contains(low, bad) && len([]rune(t)) < 80 {
+			return false
+		}
+	}
+	return true
+}

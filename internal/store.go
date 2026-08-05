@@ -112,3 +112,13 @@ func (s *Store) AdExists(ctx context.Context, channel string, msgID int64) (bool
 		channel, msgID).Scan(&exists)
 	return exists, err
 }
+
+// TextExists — такой же текст уже разобран? Каналы часто перепубликуют
+// одно объявление, а платить ИИ за повтор незачем.
+func (s *Store) TextExists(ctx context.Context, text string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM board_ads WHERE md5(original_text)=md5($1))`,
+		text).Scan(&exists)
+	return exists, err
+}

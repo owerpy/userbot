@@ -37,8 +37,9 @@ type GroqClient struct {
 
 func NewGroqClient(apiKey, model string) *GroqClient {
 	if model == "" {
-		// сильная и быстрая модель для разбора коротких текстов
-		model = "llama-3.3-70b-versatile"
+		// Баланс точности и суточной квоты на бесплатном тарифе Groq
+		// (200k токенов/сутки против 100k у llama-3.3-70b).
+		model = "openai/gpt-oss-120b"
 	}
 	return &GroqClient{
 		apiKey: apiKey,
@@ -73,6 +74,12 @@ const systemPromptTmpl = `Ты — парсер объявлений о груз
 - vehicle_type: тент/бортовой -> flatbed или closed; реф/холодильник -> refrigerator; цистерна -> tank; открытый -> open; крытый/фургон -> closed.
 - Телефон нормализуй как в тексте (можно с +998, +7 и т.п.).
 - Никогда не выдумывай данные. Чего нет — оставляй пустым/null.
+- price_text заполняй ТОЛЬКО если указана сумма денег с валютой
+  (сум, so'm, руб, тенге, $, USD). Примеры цены: «5 млн сум», «300$».
+  НЕ ЦЕНА: «2 ta kerak» (нужно 2 машины), «10 tonna», «tez kerak» (срочно),
+  «kelishamiz» / «договорная» — при договорной пиши «договорная».
+  Количество машин в цену НИКОГДА не пиши — если цены нет, оставь пусто.
+- weight_kg — это вес ГРУЗА в кг, а не количество машин.
 - ВАЖНО: cargo_desc и date_text пиши ПО-РУССКИ, даже если объявление на узбекском
   или казахском (интерфейс приложения переводит поля сам, единый язык нужен для
   консистентности). Например: «ertaga» -> «завтра», «qurilish mollari» -> «стройматериалы».
@@ -96,6 +103,10 @@ type groqReq struct {
 	Messages    []groqMsg    `json:"messages"`
 	Temperature float64      `json:"temperature"`
 	ResponseFmt groqRespType `json:"response_format"`
+	// Ответ — короткий JSON, больше не нужно (экономит квоту).
+	MaxTokens int `json:"max_completion_tokens,omitempty"`
+	// Для gpt-oss: не тратить токены на длинные размышления.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 type groqMsg struct {
 	Role    string `json:"role"`
@@ -150,6 +161,12 @@ func (g *GroqClient) parseOnce(ctx context.Context, text string) (*ParsedAd, tim
 		},
 		Temperature: 0,
 		ResponseFmt: groqRespType{Type: "json_object"},
+		MaxTokens:   500,
+	}
+	// gpt-oss по умолчанию много «размышляет» — на разбор объявления это
+	// лишний расход. Ставим минимальную глубину.
+	if strings.Contains(g.model, "gpt-oss") {
+		body.ReasoningEffort = "low"
 	}
 	buf, _ := json.Marshal(body)
 
@@ -216,4 +233,136 @@ func retryAfter(resp *http.Response, msg string) time.Duration {
 		}
 	}
 	return 5 * time.Second
+}
+
+// ── Пакетный разбор ──
+// Системный промпт (со справочником регионов) — самая тяжёлая часть запроса.
+// Отправляя объявления пачкой, платим за него один раз на всю пачку:
+// расход токенов падает примерно втрое, а число запросов — во столько раз,
+// сколько объявлений в пачке.
+
+const batchSuffix = `
+
+РЕЖИМ ПАКЕТА: пользователь пришлёт НЕСКОЛЬКО объявлений, каждое помечено
+строкой вида «=== N ===». Верни ОДИН JSON-объект:
+{"ads":[{"i":1, ...поля...}, {"i":2, ...поля...}]}
+где i — номер объявления из пометки, а остальные поля те же, что описаны выше.
+Обязательно верни запись для КАЖДОГО номера, даже если is_ad=false.`
+
+type batchResp struct {
+	Ads []struct {
+		Index int `json:"i"`
+		ParsedAd
+	} `json:"ads"`
+}
+
+// ParseBatch разбирает несколько объявлений одним запросом.
+// Возвращает срез той же длины, что и texts; элемент nil — не объявление.
+func (g *GroqClient) ParseBatch(ctx context.Context, texts []string) ([]*ParsedAd, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	if len(texts) == 1 {
+		one, err := g.Parse(ctx, texts[0])
+		if err != nil {
+			return nil, err
+		}
+		return []*ParsedAd{one}, nil
+	}
+
+	var sb strings.Builder
+	for i, t := range texts {
+		fmt.Fprintf(&sb, "=== %d ===\n%s\n\n", i+1, strings.TrimSpace(t))
+	}
+
+	const maxRetries = 8
+	for attempt := 0; ; attempt++ {
+		out, wait, err := g.parseBatchOnce(ctx, sb.String(), len(texts))
+		if err == nil {
+			return out, nil
+		}
+		if wait <= 0 || attempt >= maxRetries {
+			return nil, err
+		}
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+time.Second {
+			return nil, fmt.Errorf("groq rate limit: нужно ждать %s, не укладываемся", wait)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("groq: %w (лимит просил ждать %s)", ctx.Err(), wait)
+		case <-time.After(wait + 500*time.Millisecond):
+		}
+	}
+}
+
+func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int) ([]*ParsedAd, time.Duration, error) {
+	body := groqReq{
+		Model: g.model,
+		Messages: []groqMsg{
+			{Role: "system", Content: systemPrompt() + batchSuffix},
+			{Role: "user", Content: joined},
+		},
+		Temperature: 0,
+		ResponseFmt: groqRespType{Type: "json_object"},
+		MaxTokens:   250 * n,
+	}
+	if strings.Contains(g.model, "gpt-oss") {
+		body.ReasoningEffort = "low"
+	}
+	buf, _ := json.Marshal(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(buf))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+g.apiKey)
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, retryAfter(resp, string(raw)), fmt.Errorf("groq rate limit")
+	}
+
+	var gr groqResp
+	if err := json.Unmarshal(raw, &gr); err != nil {
+		return nil, 0, fmt.Errorf("groq decode: %w", err)
+	}
+	if gr.Error != nil {
+		if strings.Contains(strings.ToLower(gr.Error.Message), "rate limit") {
+			return nil, retryAfter(resp, gr.Error.Message), fmt.Errorf("groq rate limit")
+		}
+		return nil, 0, fmt.Errorf("groq error: %s", gr.Error.Message)
+	}
+	if len(gr.Choices) == 0 {
+		return nil, 0, fmt.Errorf("groq: empty choices")
+	}
+
+	content := strings.TrimSpace(gr.Choices[0].Message.Content)
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+
+	var br batchResp
+	if err := json.Unmarshal([]byte(content), &br); err != nil {
+		return nil, 0, fmt.Errorf("parse batch json: %w", err)
+	}
+
+	out := make([]*ParsedAd, n)
+	for _, item := range br.Ads {
+		idx := item.Index - 1
+		if idx < 0 || idx >= n {
+			continue
+		}
+		ad := item.ParsedAd
+		out[idx] = &ad
+	}
+	return out, 0, nil
 }
