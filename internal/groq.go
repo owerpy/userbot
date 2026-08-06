@@ -114,6 +114,9 @@ func (g *GroqClient) markExhausted(model string, retryAfter time.Duration) strin
 // Models — список моделей (для логов).
 func (g *GroqClient) Models() []string { return g.models }
 
+// Name — имя провайдера (для цепочки и логов).
+func (g *GroqClient) Name() string { return "groq" }
+
 const systemPromptTmpl = `Ты — парсер объявлений о грузоперевозках из Telegram-каналов СНГ.
 Текст может быть на русском, узбекском (латиница/кириллица) или казахском, в свободной форме.
 

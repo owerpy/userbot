@@ -37,9 +37,14 @@ func main() {
 	dsn := os.Getenv("DATABASE_URL")         // postgres://...
 	groqKey := os.Getenv("GROQ_API_KEY")
 	groqModel := os.Getenv("GROQ_MODEL")
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	geminiModel := os.Getenv("GEMINI_MODEL")
 
-	if appIDStr == "" || appHash == "" || phone == "" || dsn == "" || groqKey == "" {
-		log.Fatal("missing env: need TG_APP_ID, TG_APP_HASH, TG_PHONE, DATABASE_URL, GROQ_API_KEY")
+	if appIDStr == "" || appHash == "" || phone == "" || dsn == "" {
+		log.Fatal("missing env: need TG_APP_ID, TG_APP_HASH, TG_PHONE, DATABASE_URL")
+	}
+	if groqKey == "" && geminiKey == "" {
+		log.Fatal("нужен хотя бы один ключ: GROQ_API_KEY или GEMINI_API_KEY")
 	}
 	if sessionDir == "" {
 		sessionDir = "/data/session"
@@ -53,8 +58,18 @@ func main() {
 		log.Fatal("db connect", zap.Error(err))
 	}
 	defer store.Close()
-	groq := internal.NewGroqClient(groqKey, groqModel)
-	log.Info("модели Groq (переключаемся при исчерпании суточной квоты)",
+	// Цепочка провайдеров: пока есть квота у Groq — работаем на нём,
+	// кончилась — переходим на Gemini. У Gemini минутный лимит токенов
+	// на порядок больше, поэтому он хорошо добирает оставшийся поток.
+	var providers []internal.Parser
+	if groqKey != "" {
+		providers = append(providers, internal.NewGroqClient(groqKey, groqModel))
+	}
+	if geminiKey != "" {
+		providers = append(providers, internal.NewGeminiClient(geminiKey, geminiModel))
+	}
+	groq := internal.NewChain(log, providers...)
+	log.Info("провайдеры ИИ (переключаемся при исчерпании квоты)",
 		zap.Strings("models", groq.Models()))
 
 	// ── обработчик новых сообщений в каналах ──
