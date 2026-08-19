@@ -71,10 +71,17 @@ func isQuotaError(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "квота") ||
-		strings.Contains(s, "rate limit") ||
-		strings.Contains(s, "не укладываемся") ||
-		strings.Contains(s, "исчерпана")
+	for _, m := range []string{
+		"квота", "исчерпан", "не укладываемся", "rate limit",
+		// модель отключили или ключу закрыт доступ — другой провайдер спасёт
+		"недоступн", "does not exist", "decommissioned",
+		"model_not_found", "not have access",
+	} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Chain) Name() string { return "chain" }

@@ -491,7 +491,10 @@ func resolveWatched(ctx context.Context, api *tg.Client, store *internal.Store,
 	}
 	for _, c := range chans {
 		uname := strings.TrimPrefix(strings.TrimSpace(c.Channel), "@")
-		if uname == "" {
+		// Приватные ссылки-приглашения по username не резолвятся.
+		if uname == "" || strings.HasPrefix(uname, "+") {
+			log.Warn("канал задан ссылкой-приглашением — добавьте его по @имени",
+				zap.String("channel", c.Channel))
 			continue
 		}
 		res, err := api.ContactsResolveUsername(ctx, uname)
@@ -604,7 +607,10 @@ func pollChannels(ctx context.Context, api *tg.Client, store *internal.Store,
 	}
 	for _, c := range chans {
 		uname := strings.TrimPrefix(strings.TrimSpace(c.Channel), "@")
-		if uname == "" {
+		// Ссылка-приглашение вида «+HIY2UL…» — это не username, по нему
+		// канал не найти. Нужно вступить в канал и добавить его по @имени
+		// либо по числовому id.
+		if uname == "" || strings.HasPrefix(uname, "+") {
 			continue
 		}
 		res, err := api.ContactsResolveUsername(ctx, uname)
@@ -646,7 +652,7 @@ func pollChannels(ctx context.Context, api *tg.Client, store *internal.Store,
 			queued++
 		}
 		if queued > 0 {
-			log.Debug("опрос канала", zap.String("channel", c.Channel),
+			log.Info("опрос канала", zap.String("channel", c.Channel),
 				zap.Int("messages", queued))
 		}
 		time.Sleep(time.Second) // не частим запросами к Telegram

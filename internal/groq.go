@@ -62,10 +62,11 @@ func NewGroqClient(apiKey, model string) *GroqClient {
 		// По умолчанию — цепочка от самой точной к самой ёмкой по квоте.
 		// Порядок: сначала самая точная, дальше по убыванию качества
 		// (но по возрастанию доступной суточной квоты).
+		// Llama-модели Groq отключил 17.06.2026, взамен рекомендованы эти.
 		models = []string{
-			"llama-3.3-70b-versatile", // точнее всех, 100k/сутки
-			"openai/gpt-oss-120b",     // почти так же точно, 200k/сутки
-			"llama-3.1-8b-instant",    // слабее, но квота самая большая
+			"openai/gpt-oss-120b", // основная: точная, 200k токенов/сутки
+			"qwen/qwen3.6-27b",    // запасная того же класса
+			"openai/gpt-oss-20b",  // лёгкая, когда у старших кончилась квота
 		}
 	}
 	return &GroqClient{
@@ -220,9 +221,10 @@ func (g *GroqClient) Parse(ctx context.Context, text string) (*ParsedAd, error) 
 		}
 		// Модель не смогла отдать JSON — пробуем следующую в списке.
 		if errors.Is(err, errModelFailed) {
-			next := g.markExhausted(model, 10*time.Minute)
+			// Отключённая моделью не станет снова — откладываем надолго.
+			next := g.markExhausted(model, 12*time.Hour)
 			if next == "" || attempt >= maxRetries {
-				return nil, err
+				return nil, fmt.Errorf("groq: все модели недоступны/исчерпаны: %w", err)
 			}
 			model = next
 			continue
@@ -301,7 +303,8 @@ func (g *GroqClient) parseOnce(ctx context.Context, text, model string) (*Parsed
 		if strings.Contains(low, "rate limit") {
 			return nil, retryAfter(resp, gr.Error.Message), fmt.Errorf("groq rate limit")
 		}
-		if strings.Contains(low, "json_validate") || strings.Contains(low, "validate json") {
+		if isModelGone(low) || strings.Contains(low, "json_validate") ||
+			strings.Contains(low, "validate json") {
 			return nil, 0, errModelFailed
 		}
 		return nil, 0, fmt.Errorf("groq error: %s", gr.Error.Message)
@@ -355,6 +358,20 @@ const batchSuffix = `
 где i — номер объявления из пометки, а остальные поля те же, что описаны выше.
 Обязательно верни запись для КАЖДОГО номера, даже если is_ad=false.`
 
+// isModelGone — модель отключена, переименована или недоступна ключу.
+// Тогда нет смысла повторять: переходим к следующей модели или провайдеру.
+func isModelGone(low string) bool {
+	for _, m := range []string{
+		"does not exist", "decommissioned", "model_not_found",
+		"not have access", "no longer supported", "has been deprecated",
+	} {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // errModelFailed — модель не справилась с ответом (не квота).
 // Разумно попробовать другую модель, а не терять объявления.
 var errModelFailed = errors.New("groq: модель вернула некорректный ответ")
@@ -397,9 +414,10 @@ func (g *GroqClient) ParseBatch(ctx context.Context, texts []string) ([]*ParsedA
 		}
 		// Модель не смогла отдать JSON — пробуем следующую в списке.
 		if errors.Is(err, errModelFailed) {
-			next := g.markExhausted(model, 10*time.Minute)
+			// Отключённая моделью не станет снова — откладываем надолго.
+			next := g.markExhausted(model, 12*time.Hour)
 			if next == "" || attempt >= maxRetries {
-				return nil, err
+				return nil, fmt.Errorf("groq: все модели недоступны/исчерпаны: %w", err)
 			}
 			model = next
 			continue
@@ -472,7 +490,8 @@ func (g *GroqClient) parseBatchOnce(ctx context.Context, joined string, n int, m
 		if strings.Contains(low, "rate limit") {
 			return nil, retryAfter(resp, gr.Error.Message), fmt.Errorf("groq rate limit")
 		}
-		if strings.Contains(low, "json_validate") || strings.Contains(low, "validate json") {
+		if isModelGone(low) || strings.Contains(low, "json_validate") ||
+			strings.Contains(low, "validate json") {
 			return nil, 0, errModelFailed
 		}
 		return nil, 0, fmt.Errorf("groq error: %s", gr.Error.Message)
