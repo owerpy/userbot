@@ -383,6 +383,18 @@ func lookupRegion(raw string) (string, string, bool) {
 
 // vehicleAliases — свободный текст в объявлении → код кузова приложения.
 var vehicleAliases = map[string]string{
+	// Малотоннажные — в объявлениях пишут марку машины
+	"labo": "labo", "лабо": "labo", "damas": "labo", "дамас": "labo",
+	"damask": "labo", "labo damas": "labo",
+	"gazel": "gazelle", "gazelle": "gazelle", "газель": "gazelle",
+	"gazell": "gazelle", "gazelcha": "gazelle",
+	"isuzu5": "isuzu_5", "isuzu3": "isuzu_5", "исузу5": "isuzu_5",
+	"isuzu35": "isuzu_5", "исузу35": "isuzu_5",
+	"isuzu10": "isuzu_10", "исузу10": "isuzu_10",
+	"isuzu": "isuzu_5", "исузу": "isuzu_5",
+	"shacman": "shacman", "чакман": "shacman", "shakman": "shacman",
+	"шакман": "shacman", "chakman": "shacman",
+
 	"tent": "closed", "tentli": "closed", "тент": "closed", "тентованный": "closed",
 	"tentovanniy": "closed", "yopiq": "closed", "фургон": "closed", "furgon": "closed",
 	"izotermik": "closed", "изотерм": "closed", "closed": "closed",
